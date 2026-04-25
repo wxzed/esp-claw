@@ -60,6 +60,14 @@ typedef struct audio_lua_handle_t {
      * underlying codec_dev as STEREO and duplicate every mono sample to
      * both slots on write. The lua side keeps seeing a 1-channel handle. */
     bool                   mono_expand;
+    /* INPUT-only: number of physical hardware slots on the wire (e.g. ES7243E
+     * on the DFRobot K10 board is wired as 4-slot TDM even when the user only
+     * wants the first mic). When non-zero we open the underlying codec_dev
+     * with channel = hw_channels and channel_mask = the lowest `channels`
+     * bits, so the I2S TDM controller is configured with the correct
+     * total_slot/ws_width and the read buffer only contains the slots the
+     * user asked for. Must be 0 (= use `channels` directly) or >= channels. */
+    uint8_t                hw_channels;
 } audio_lua_handle_t;
 
 /* --------------------------------------------------------------------------
@@ -260,6 +268,22 @@ static esp_err_t audio_handle_activate(audio_lua_handle_t *handle)
         .channel = (uint8_t)(handle->mono_expand ? 2 : handle->channels),
         .bits_per_sample = handle->bits_per_sample,
     };
+
+    /* INPUT TDM mapping: open codec_dev with the physical slot count + a
+     * channel_mask that selects only the first `channels` slots. The I2S TDM
+     * controller is then configured with total_slot = hw_channels (matching
+     * the codec wire format), and the data interface returns only the
+     * selected slots so the lua-side buffer layout stays as `channels`. */
+    if (handle->kind == AUDIO_HANDLE_INPUT &&
+        handle->hw_channels > 0 &&
+        handle->hw_channels > handle->channels) {
+        fs.channel = handle->hw_channels;
+        uint16_t mask = 0;
+        for (uint8_t i = 0; i < handle->channels; i++) {
+            mask |= (uint16_t)(1U << i);
+        }
+        fs.channel_mask = mask;
+    }
     int ret;
 
     ret = esp_codec_dev_open(handle->codec_dev, &fs);
@@ -393,8 +417,17 @@ static int lua_audio_handle_gc(lua_State *L)
 }
 
 /* --------------------------------------------------------------------------
- * audio.new_input(codec_dev_handle, sample_rate, channels, bits_per_sample [, gain_db])
+ * audio.new_input(codec_dev_handle, sample_rate, channels, bits_per_sample
+ *                 [, gain_db [, hw_channels]])
  *   -> handle | nil, errmsg
+ *
+ * `hw_channels` is the number of physical wire slots the codec emits per
+ * frame (e.g. 4 for ES7243E in TDM mode on DFRobot K10). When omitted or 0,
+ * the codec_dev is opened with `channels` directly. When set, the codec_dev
+ * is opened with channel = hw_channels and the lowest `channels` slots are
+ * selected via channel_mask, so the I2S TDM controller is configured with
+ * the correct total_slot/ws_width while the lua-visible PCM stream still has
+ * `channels` channels.
  * -------------------------------------------------------------------------- */
 static int lua_audio_new_input(lua_State *L)
 {
@@ -407,6 +440,16 @@ static int lua_audio_new_input(lua_State *L)
     handle.channels = lua_audio_check_u8_arg(L, 3, "channels");
     handle.bits_per_sample = lua_audio_check_u8_arg(L, 4, "bits_per_sample");
     handle.in_gain_db = (float)luaL_optnumber(L, 5, AUDIO_DEFAULT_GAIN_DB);
+
+    lua_Integer hw_ch = luaL_optinteger(L, 6, 0);
+    if (hw_ch < 0 || hw_ch > UINT8_MAX) {
+        return luaL_error(L, "audio new_input: hw_channels must be 0..255");
+    }
+    if (hw_ch > 0 && hw_ch < handle.channels) {
+        return luaL_error(L, "audio new_input: hw_channels (%d) must be >= channels (%d)",
+                          (int)hw_ch, (int)handle.channels);
+    }
+    handle.hw_channels = (uint8_t)hw_ch;
 
     if (audio_handle_activate(&handle) != ESP_OK) {
         lua_pushnil(L);
