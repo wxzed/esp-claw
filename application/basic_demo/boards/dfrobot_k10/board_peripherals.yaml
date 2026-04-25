@@ -1,7 +1,8 @@
 # Peripherals Configuration for DFRobot K10
 peripherals:
 
-  # I2C bus (port 1) — IO expander (TCA9555); mic/ES7243E device removed for speaker-only bring-up
+  # I2C bus (port 1) — shared by IO expander (TCA9555), audio codec (ES7243E),
+  # and camera SCCB (GC2145).
   - name: i2c_master
     type: i2c
     role: master
@@ -11,13 +12,13 @@ peripherals:
         sda: 47   # AUDIO_CODEC_I2C_SDA_PIN
         scl: 48   # AUDIO_CODEC_I2C_SCL_PIN
 
-  # I2S output — STD Philips, 24 kHz; NS4168 on DOUT (GPIO45).
-  # Mono stream on right slot only (no stereo interleaved buffer); matches board request for right-channel playback.
+  # I2S0 TX — STD Philips, 24 kHz; NS4168 on DOUT (GPIO45). MCLK left to the
+  # RX path which will route GPIO3 when ES7243E is initialised.
   - name: i2s_audio_out
     type: i2s
     role: master
     format: std-out
-    config: &i2s0_config
+    config:
       port: 0
       sample_rate_hz: 24000
       mclk_multiple: 256
@@ -29,11 +30,38 @@ peripherals:
       left_align: true
       bit_shift: true
       pins:
-        mclk: -1   # TX path does not use MCLK on K10
-        bclk: 0    # AUDIO_I2S_GPIO_BCLK
-        ws: 38     # AUDIO_I2S_GPIO_WS
+        mclk: -1   # MCLK pad is owned by the TDM-IN path below
+        bclk: 0    # AUDIO_I2S_GPIO_BCLK (shared with RX)
+        ws: 38     # AUDIO_I2S_GPIO_WS   (shared with RX)
         dout: 45   # AUDIO_I2S_GPIO_DOUT
         din: -1    # unused for TX
+
+  # I2S0 RX — TDM 4-slot @ 24 kHz; ES7243E mic codec, 16-bit per slot.
+  # Channels: SLOT0 = mic, SLOT1 = AEC reference (loopback from speaker line),
+  # SLOT2/3 unused. BCLK/WS share the pads with i2s_audio_out; MCLK on GPIO3
+  # drives the codec's master clock.
+  - name: i2s_audio_in
+    type: i2s
+    role: master
+    format: tdm-in
+    config:
+      port: 0
+      sample_rate_hz: 24000
+      mclk_multiple: 256
+      bclk_div: 8
+      data_bit_width: 16
+      slot_bit_width: I2S_SLOT_BIT_WIDTH_AUTO
+      slot_mode: I2S_SLOT_MODE_STEREO
+      total_slot: 4
+      ws_width: 16
+      left_align: false
+      bit_shift: true
+      pins:
+        mclk: 3    # AUDIO_I2S_GPIO_MCLK
+        bclk: 0    # shared with i2s_audio_out
+        ws: 38     # shared with i2s_audio_out
+        dout: -1   # unused for RX
+        din: 39    # AUDIO_I2S_GPIO_DIN
 
   # SPI bus — ILI9341 320×240 LCD
   - name: spi_master

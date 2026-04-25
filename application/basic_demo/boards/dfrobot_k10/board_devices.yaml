@@ -40,6 +40,65 @@ devices:
     peripherals:
       - name: i2s_audio_out
 
+  # Audio ADC input path (microphone + AEC reference): ES7243E over I2S0 TDM-IN.
+  # I2C address 0x22 (8-bit form of 7-bit 0x11; K10 ties ES7243E AD0 high so
+  # the chip's 7-bit address moves from default 0x10 to 0x11). adc_channel_mask
+  # "0011" keeps SLOT0 (mic) and SLOT1 (reference) and drops the unused
+  # SLOT2/3 inside the codec driver.
+  - name: audio_adc
+    chip: es7243e
+    type: audio_codec
+    version: default
+    config:
+      adc_enabled: true
+      dac_enabled: false
+      adc_max_channel: 4
+      adc_channel_mask: "0011"
+      adc_init_gain: 0
+      mclk_enabled: true
+    peripherals:
+      - name: i2s_audio_in
+      - name: i2c_master
+        address: 0x22
+        frequency: 400000
+
+  # Camera: GC2145 (2 MP) over DVP 8-bit, SCCB on the shared I2C bus.
+  # XCLK from GPIO7 (6 MHz, matches xiaozhi df-k10 BSP).
+  - name: camera
+    type: camera
+    sub_type: dvp
+    version: default
+    config:
+      dvp_config:
+        reset_io: -1
+        pwdn_io: -1
+        vsync_io: 4
+        de_io: 5         # HREF
+        pclk_io: 17
+        xclk_io: 7
+        xclk_freq: 6000000
+        data_width: CAM_CTLR_DATA_WIDTH_8
+        data_io:
+          data_io_0: 8   # CAMERA_PIN_D2
+          data_io_1: 10  # CAMERA_PIN_D3
+          data_io_2: 11  # CAMERA_PIN_D4
+          data_io_3: 9   # CAMERA_PIN_D5
+          data_io_4: 18  # CAMERA_PIN_D6
+          data_io_5: 16  # CAMERA_PIN_D7
+          data_io_6: 15  # CAMERA_PIN_D8
+          data_io_7: 6   # CAMERA_PIN_D9
+          data_io_8: -1
+          data_io_9: -1
+          data_io_10: -1
+          data_io_11: -1
+          data_io_12: -1
+          data_io_13: -1
+          data_io_14: -1
+          data_io_15: -1
+    peripherals:
+      - name: i2c_master
+        frequency: 100000   # SCCB
+
   # LCD: ILI9341 320×240 via SPI3
   - name: display_lcd
     chip: ili9341
