@@ -1,0 +1,31 @@
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# DFRobot K10: 16 MB QIO flash @ 80 MHz
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# DFRobot K10: 8 MB octal PSRAM @ 80 MHz
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# K10 audio output uses internal/dummy codec path over I2S TX.
+CONFIG_CODEC_DUMMY_SUPPORT=y
+
+# K10 microphone: ES7243E (4-slot TDM, mic + AEC reference) on I2S0 RX.
+CONFIG_CODEC_ES7243E_SUPPORT=y
+
+# K10 camera: GC2145 over DVP 8-bit (esp_video).
+# AUTO_DETECT_DVP and the default DVP format (RGB565 BE 640x480 15fps)
+# are both `default y` on ESP32-S3 once CAMERA_GC2145=y, no extra knobs needed.
+CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT=y
+CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=y
+CONFIG_CAMERA_GC2145=y
+
+# Verbose logs while bringing the camera up; drop back to INFO once stable.
+# (Compile in DEBUG-level entries so esp_log_level_set("gc2145", DEBUG) etc.
+# can be flipped at runtime; default level stays INFO so noisy logs do not
+# spam normal operation.)
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

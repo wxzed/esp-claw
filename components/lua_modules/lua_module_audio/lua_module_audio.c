@@ -52,6 +52,22 @@ typedef struct audio_lua_handle_t {
     uint8_t                bytes_per_sample;
     int                    out_vol;
     float                  in_gain_db;
+    /* When the user opens an OUTPUT handle as mono (channels == 1), some
+     * codecs (e.g. esp_codec_dev I2S path) hard-route a single channel to
+     * the LEFT slot only. Boards whose external amplifier is wired to the
+     * RIGHT slot would then stay silent. To keep the lua API ("mono in")
+     * working regardless of the board wiring, we transparently open the
+     * underlying codec_dev as STEREO and duplicate every mono sample to
+     * both slots on write. The lua side keeps seeing a 1-channel handle. */
+    bool                   mono_expand;
+    /* INPUT-only: number of physical hardware slots on the wire (e.g. ES7243E
+     * on the DFRobot K10 board is wired as 4-slot TDM even when the user only
+     * wants the first mic). When non-zero we open the underlying codec_dev
+     * with channel = hw_channels and channel_mask = the lowest `channels`
+     * bits, so the I2S TDM controller is configured with the correct
+     * total_slot/ws_width and the read buffer only contains the slots the
+     * user asked for. Must be 0 (= use `channels` directly) or >= channels. */
+    uint8_t                hw_channels;
 } audio_lua_handle_t;
 
 /* --------------------------------------------------------------------------
@@ -241,16 +257,34 @@ static esp_err_t audio_validate_handle_formats(const audio_lua_handle_t *input,
 
 static esp_err_t audio_handle_activate(audio_lua_handle_t *handle)
 {
-    esp_codec_dev_sample_info_t fs = {
-        .sample_rate = handle->sample_rate,
-        .channel = handle->channels,
-        .bits_per_sample = handle->bits_per_sample,
-    };
-    int ret;
-
     if (audio_validate_sample_info(handle) != ESP_OK) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    handle->mono_expand = (handle->kind == AUDIO_HANDLE_OUTPUT && handle->channels == 1);
+
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate = handle->sample_rate,
+        .channel = (uint8_t)(handle->mono_expand ? 2 : handle->channels),
+        .bits_per_sample = handle->bits_per_sample,
+    };
+
+    /* INPUT TDM mapping: open codec_dev with the physical slot count + a
+     * channel_mask that selects only the first `channels` slots. The I2S TDM
+     * controller is then configured with total_slot = hw_channels (matching
+     * the codec wire format), and the data interface returns only the
+     * selected slots so the lua-side buffer layout stays as `channels`. */
+    if (handle->kind == AUDIO_HANDLE_INPUT &&
+        handle->hw_channels > 0 &&
+        handle->hw_channels > handle->channels) {
+        fs.channel = handle->hw_channels;
+        uint16_t mask = 0;
+        for (uint8_t i = 0; i < handle->channels; i++) {
+            mask |= (uint16_t)(1U << i);
+        }
+        fs.channel_mask = mask;
+    }
+    int ret;
 
     ret = esp_codec_dev_open(handle->codec_dev, &fs);
     if (ret != ESP_CODEC_DEV_OK) {
@@ -383,8 +417,17 @@ static int lua_audio_handle_gc(lua_State *L)
 }
 
 /* --------------------------------------------------------------------------
- * audio.new_input(codec_dev_handle, sample_rate, channels, bits_per_sample [, gain_db])
+ * audio.new_input(codec_dev_handle, sample_rate, channels, bits_per_sample
+ *                 [, gain_db [, hw_channels]])
  *   -> handle | nil, errmsg
+ *
+ * `hw_channels` is the number of physical wire slots the codec emits per
+ * frame (e.g. 4 for ES7243E in TDM mode on DFRobot K10). When omitted or 0,
+ * the codec_dev is opened with `channels` directly. When set, the codec_dev
+ * is opened with channel = hw_channels and the lowest `channels` slots are
+ * selected via channel_mask, so the I2S TDM controller is configured with
+ * the correct total_slot/ws_width while the lua-visible PCM stream still has
+ * `channels` channels.
  * -------------------------------------------------------------------------- */
 static int lua_audio_new_input(lua_State *L)
 {
@@ -397,6 +440,16 @@ static int lua_audio_new_input(lua_State *L)
     handle.channels = lua_audio_check_u8_arg(L, 3, "channels");
     handle.bits_per_sample = lua_audio_check_u8_arg(L, 4, "bits_per_sample");
     handle.in_gain_db = (float)luaL_optnumber(L, 5, AUDIO_DEFAULT_GAIN_DB);
+
+    lua_Integer hw_ch = luaL_optinteger(L, 6, 0);
+    if (hw_ch < 0 || hw_ch > UINT8_MAX) {
+        return luaL_error(L, "audio new_input: hw_channels must be 0..255");
+    }
+    if (hw_ch > 0 && hw_ch < handle.channels) {
+        return luaL_error(L, "audio new_input: hw_channels (%d) must be >= channels (%d)",
+                          (int)hw_ch, (int)handle.channels);
+    }
+    handle.hw_channels = (uint8_t)hw_ch;
 
     if (audio_handle_activate(&handle) != ESP_OK) {
         lua_pushnil(L);
@@ -460,7 +513,8 @@ static int lua_audio_play_wav(lua_State *L)
     audio_lua_handle_t *dac = lua_audio_check_handle(L, 1, AUDIO_HANDLE_OUTPUT, "play_wav");
     const char *path = luaL_checkstring(L, 2);
     FILE *f = NULL;
-    uint8_t *buf = NULL;
+    uint8_t *read_buf = NULL;
+    uint8_t *write_buf = NULL;
     audio_wav_info_t info = {0};
 
     if (!audio_path_valid(path, ".wav")) {
@@ -485,22 +539,51 @@ static int lua_audio_play_wav(lua_State *L)
         goto cleanup;
     }
 
-    buf = malloc(AUDIO_CHUNK_BYTES);
-    if (!buf) {
+    /* read_chunk_bytes must be aligned to a whole mono frame so we can
+     * cleanly duplicate every sample into the stereo write buffer. */
+    size_t read_chunk_bytes = AUDIO_CHUNK_BYTES;
+    if (dac->mono_expand) {
+        read_chunk_bytes -= read_chunk_bytes % dac->bytes_per_sample;
+        if (read_chunk_bytes == 0) {
+            read_chunk_bytes = dac->bytes_per_sample;
+        }
+    }
+
+    read_buf = malloc(read_chunk_bytes);
+    if (!read_buf) {
         luaL_error(L, "audio play_wav: out of memory");
         goto cleanup;
+    }
+    if (dac->mono_expand) {
+        write_buf = malloc(read_chunk_bytes * 2);
+        if (!write_buf) {
+            luaL_error(L, "audio play_wav: out of memory");
+            goto cleanup;
+        }
+    } else {
+        write_buf = read_buf;
     }
 
     fseek(f, (long)info.data_offset, SEEK_SET);
     uint32_t remaining = info.data_size;
     while (remaining > 0) {
-        size_t chunk = remaining < AUDIO_CHUNK_BYTES ? remaining : AUDIO_CHUNK_BYTES;
-        size_t read = fread(buf, 1, chunk, f);
+        size_t chunk = remaining < read_chunk_bytes ? remaining : read_chunk_bytes;
+        size_t read = fread(read_buf, 1, chunk, f);
         if (read == 0) {
             luaL_error(L, "audio play_wav: truncated data");
             goto cleanup;
         }
-        if (esp_codec_dev_write(dac->codec_dev, buf, (int)read) != ESP_CODEC_DEV_OK) {
+        size_t to_write = read;
+        if (dac->mono_expand) {
+            size_t n_samples = read / dac->bytes_per_sample;
+            const uint8_t bps = dac->bytes_per_sample;
+            for (size_t i = 0; i < n_samples; i++) {
+                memcpy(write_buf + (i * 2) * bps,        read_buf + i * bps, bps);
+                memcpy(write_buf + (i * 2 + 1) * bps,    read_buf + i * bps, bps);
+            }
+            to_write = n_samples * bps * 2;
+        }
+        if (esp_codec_dev_write(dac->codec_dev, write_buf, (int)to_write) != ESP_CODEC_DEV_OK) {
             luaL_error(L, "audio play_wav: write failed");
             goto cleanup;
         }
@@ -508,7 +591,10 @@ static int lua_audio_play_wav(lua_State *L)
     }
 
 cleanup:
-    free(buf);
+    if (write_buf != read_buf) {
+        free(write_buf);
+    }
+    free(read_buf);
     if (f) {
         fclose(f);
     }
@@ -550,7 +636,11 @@ static int lua_audio_play_tone(lua_State *L)
         return luaL_error(L, "audio play_tone: freq_hz must be less than half of sample_rate");
     }
 
-    chunk_frames = AUDIO_CHUNK_BYTES / (dac->channels * dac->bytes_per_sample);
+    /* When mono_expand is on, codec_dev was opened as STEREO so we have to
+     * fill both slots; treat the buffer as if it were a 2-channel stream. */
+    uint8_t effective_channels = dac->mono_expand ? 2 : dac->channels;
+
+    chunk_frames = AUDIO_CHUNK_BYTES / (effective_channels * dac->bytes_per_sample);
     if (chunk_frames == 0) {
         return luaL_error(L, "audio play_tone: invalid output frame size");
     }
@@ -571,7 +661,7 @@ static int lua_audio_play_tone(lua_State *L)
     amplitude = 32767.0f * gain_scale;
     phase_step = 2.0f * (float)M_PI * (float)freq_hz / (float)dac->sample_rate;
 
-    buf = malloc(chunk_frames * dac->channels * dac->bytes_per_sample);
+    buf = (int16_t *)malloc(chunk_frames * effective_channels * sizeof(int16_t));
     if (!buf) {
         return luaL_error(L, "audio play_tone: out of memory");
     }
@@ -584,18 +674,9 @@ static int lua_audio_play_tone(lua_State *L)
         }
 
         for (uint32_t i = 0; i < frames_this_chunk; i++) {
-            int16_t sample16 = (int16_t)(sinf(phase) * amplitude);
-            if (dac->bits_per_sample == 16) {
-                int16_t *p = (int16_t *)buf + (size_t)i * dac->channels;
-                for (uint8_t ch = 0; ch < dac->channels; ch++) {
-                    p[ch] = sample16;
-                }
-            } else {
-                int32_t sample32 = (int32_t)sample16 << 16;
-                int32_t *p = (int32_t *)buf + (size_t)i * dac->channels;
-                for (uint8_t ch = 0; ch < dac->channels; ch++) {
-                    p[ch] = sample32;
-                }
+            int16_t sample = (int16_t)(sinf(phase) * amplitude);
+            for (uint8_t ch = 0; ch < effective_channels; ch++) {
+                ((int16_t *)buf)[i * effective_channels + ch] = sample;
             }
             phase += phase_step;
             if (phase >= 2.0f * (float)M_PI) {
@@ -603,8 +684,8 @@ static int lua_audio_play_tone(lua_State *L)
             }
         }
 
-        int bytes_to_write = (int)(frames_this_chunk * dac->channels * dac->bytes_per_sample);
-        if (esp_codec_dev_write(dac->codec_dev, buf, bytes_to_write) != ESP_CODEC_DEV_OK) {
+        if (esp_codec_dev_write(dac->codec_dev, buf,
+                                (int)(frames_this_chunk * effective_channels * sizeof(int16_t))) != ESP_CODEC_DEV_OK) {
             free(buf);
             return luaL_error(L, "audio play_tone: write failed");
         }
@@ -720,16 +801,36 @@ static int lua_audio_loopback(lua_State *L)
     audio_lua_handle_t *adc = lua_audio_check_handle(L, 1, AUDIO_HANDLE_INPUT, "loopback");
     audio_lua_handle_t *dac = lua_audio_check_handle(L, 2, AUDIO_HANDLE_OUTPUT, "loopback");
     uint32_t duration_ms = (uint32_t)luaL_optinteger(L, 3, 1000);
-    uint8_t *buf = NULL;
+    uint8_t *read_buf = NULL;
+    uint8_t *write_buf = NULL;
 
     if (audio_validate_handle_formats(adc, dac) != ESP_OK) {
         return luaL_error(L, "audio loopback: input/output handle formats must match");
     }
 
-    buf = malloc(AUDIO_CHUNK_BYTES);
-    if (!buf) {
+    /* Keep mono read aligned to a whole frame so we can duplicate samples
+     * cleanly when the DAC was opened with mono_expand. */
+    size_t read_chunk_bytes = AUDIO_CHUNK_BYTES;
+    if (dac->mono_expand) {
+        read_chunk_bytes -= read_chunk_bytes % dac->bytes_per_sample;
+        if (read_chunk_bytes == 0) {
+            read_chunk_bytes = dac->bytes_per_sample;
+        }
+    }
+
+    read_buf = malloc(read_chunk_bytes);
+    if (!read_buf) {
         luaL_error(L, "audio loopback: out of memory");
         goto cleanup;
+    }
+    if (dac->mono_expand) {
+        write_buf = malloc(read_chunk_bytes * 2);
+        if (!write_buf) {
+            luaL_error(L, "audio loopback: out of memory");
+            goto cleanup;
+        }
+    } else {
+        write_buf = read_buf;
     }
 
     uint32_t total_bytes =
@@ -740,15 +841,25 @@ static int lua_audio_loopback(lua_State *L)
     ESP_LOGI(TAG, "loopback start: %" PRIu32 " ms (%" PRIu32 " bytes)", duration_ms, total_bytes);
     while (transferred < total_bytes) {
         uint32_t chunk = total_bytes - transferred;
-        if (chunk > AUDIO_CHUNK_BYTES) {
-            chunk = AUDIO_CHUNK_BYTES;
+        if (chunk > read_chunk_bytes) {
+            chunk = (uint32_t)read_chunk_bytes;
         }
 
-        if (esp_codec_dev_read(adc->codec_dev, buf, (int)chunk) != ESP_CODEC_DEV_OK) {
+        if (esp_codec_dev_read(adc->codec_dev, read_buf, (int)chunk) != ESP_CODEC_DEV_OK) {
             luaL_error(L, "audio loopback: input read failed");
             goto cleanup;
         }
-        if (esp_codec_dev_write(dac->codec_dev, buf, (int)chunk) != ESP_CODEC_DEV_OK) {
+        size_t to_write = chunk;
+        if (dac->mono_expand) {
+            size_t n_samples = chunk / dac->bytes_per_sample;
+            const uint8_t bps = dac->bytes_per_sample;
+            for (size_t i = 0; i < n_samples; i++) {
+                memcpy(write_buf + (i * 2) * bps,        read_buf + i * bps, bps);
+                memcpy(write_buf + (i * 2 + 1) * bps,    read_buf + i * bps, bps);
+            }
+            to_write = n_samples * bps * 2;
+        }
+        if (esp_codec_dev_write(dac->codec_dev, write_buf, (int)to_write) != ESP_CODEC_DEV_OK) {
             luaL_error(L, "audio loopback: output write failed");
             goto cleanup;
         }
@@ -757,7 +868,10 @@ static int lua_audio_loopback(lua_State *L)
     ESP_LOGI(TAG, "loopback done");
 
 cleanup:
-    free(buf);
+    if (write_buf != read_buf) {
+        free(write_buf);
+    }
+    free(read_buf);
     return 0;
 }
 
